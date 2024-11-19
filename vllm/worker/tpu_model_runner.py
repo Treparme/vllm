@@ -139,12 +139,7 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
             model = get_model(vllm_config=self.vllm_config)
         model = model.eval()
         xm.wait_device_ops()
-
-        model = ModelWrapper(model)
-        self.model = torch.compile(model,
-                                   backend="openxla",
-                                   fullgraph=True,
-                                   dynamic=False)
+        self.model = ModelWrapper(model, self.vllm_config)
 
     def _dummy_run(
         self,
@@ -709,9 +704,32 @@ class TPUModelRunner(ModelRunnerBase[ModelInputForTPU]):
 
 class ModelWrapper(nn.Module):
 
-    def __init__(self, model: nn.Module):
-        super().__init__()
+    def __init__(self, model: nn.Module, vllm_config: VllmConfig):
         self.model = model
+        compiled_callable = torch.compile(self.forward,
+                                          backend="openxla",
+                                          fullgraph=True,
+                                          dynamic=False)
+        super().__init__(
+            compiled_callable,
+            compilation_level=vllm_config.compilation_config.level)
+
+    def __call__(self, *args, is_prompt: bool, **kwargs):
+        if len(self.compiled_codes) < 3 or not self.use_custom_dispatcher:
+            # not fully compiled yet, or not using the custom dispatcher,
+            # let PyTorch handle it
+            return self.compiled_callable(*args, **kwargs)
+        # the 3 compiled codes are:
+        # 0: for profiling
+        # 1: for prompt
+        # 2: for decode
+        # dispatch to the compiled code directly, skip PyTorch
+        if is_prompt:
+            with self.dispatch_to_code(1):
+                return self.forward(*args, **kwargs)
+        else:
+            with self.dispatch_to_code(2):
+                return self.forward(*args, **kwargs)
 
     def forward(
         self,
